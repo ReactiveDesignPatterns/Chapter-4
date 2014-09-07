@@ -1,23 +1,23 @@
 package com.reactivedesignpatterns.chapter4
 
-import org.scalatest.WordSpec
-import org.scalatest.Matchers
-import akka.actor.ActorSystem
-import org.scalatest.BeforeAndAfterAll
-import akka.testkit.TestProbe
-import akka.actor.Props
-import akka.actor.ActorRef
-import scala.concurrent.duration._
-import akka.actor.Actor
-import com.reactivedesignpatterns.Scoped._
+import scala.concurrent.duration.{ DurationInt, FiniteDuration }
 import scala.util.Try
+import org.scalatest.{ BeforeAndAfterAll, Matchers, WordSpec }
+import com.reactivedesignpatterns.Scoped.scoped
+import com.reactivedesignpatterns.Defaults._
+import akka.actor.{ Actor, ActorRef, ActorSystem, Props, actorRef2Scala }
+import akka.testkit.TestProbe
+import akka.util.Timeout
+import scala.concurrent.Await
+import scala.concurrent.Future
+import com.typesafe.config.ConfigFactory
 
 object EchoServiceSpec {
   import EchoService._
 
   case class TestSLA(echo: ActorRef, n: Int, maxParallelism: Int, reportTo: ActorRef)
   case object AbortSLATest
-  case class SLAResponse(timings: Seq[FiniteDuration], outstanding: Map[String, Deadline])
+  case class SLAResponse(timings: Seq[FiniteDuration], outstanding: Map[String, Timestamp])
 
   class ParallelSLATester extends Actor {
 
@@ -34,7 +34,7 @@ object EchoServiceSpec {
                 echo: ActorRef,
                 remaining: Int,
                 receiver: ActorRef,
-                outstanding: Map[String, Deadline],
+                outstanding: Map[String, Timestamp],
                 timings: List[FiniteDuration]): Receive = {
       case TimedResponse(Response(r), d) =>
         val start = outstanding(r)
@@ -53,7 +53,7 @@ object EchoServiceSpec {
         reportTo ! SLAResponse(timings, outstanding)
     }
 
-    def finishing(reportTo: ActorRef, outstanding: Map[String, Deadline], timings: List[FiniteDuration]): Receive = {
+    def finishing(reportTo: ActorRef, outstanding: Map[String, Timestamp], timings: List[FiniteDuration]): Receive = {
       case TimedResponse(Response(r), d) =>
         val start = outstanding(r)
         scoped(outstanding - r, (d - start) :: timings) { (outstanding, timings) =>
@@ -69,20 +69,21 @@ object EchoServiceSpec {
 
     val idGenerator = Iterator from 1 map (i => s"test-$i")
 
-    def sendRequest(echo: ActorRef, receiver: ActorRef): (String, Deadline) = {
+    def sendRequest(echo: ActorRef, receiver: ActorRef): (String, Timestamp) = {
       val request = idGenerator.next
+      val timestamp = Timestamp.now
       echo ! Request(request, receiver)
-      request -> Deadline.now
+      request -> timestamp
     }
   }
 
   private def receiverProps(controller: ActorRef) = Props(new ParallelSLATestReceiver(controller))
-  private case class TimedResponse(r: Response, d: Deadline)
+  private case class TimedResponse(r: Response, d: Timestamp)
 
   // timestamp received replies in a dedicated actor to keep timing distortions low
   private class ParallelSLATestReceiver(controller: ActorRef) extends Actor {
     def receive = {
-      case r: Response => controller ! TimedResponse(r, Deadline.now)
+      case r: Response => controller ! TimedResponse(r, Timestamp.now)
     }
   }
 
@@ -92,7 +93,24 @@ class EchoServiceSpec extends WordSpec with Matchers with BeforeAndAfterAll {
   import EchoServiceSpec._
 
   // implicitly picked up to create TestProbes, lazy to only start when used
-  implicit lazy val system = ActorSystem("EchoServiceSpec")
+  implicit lazy val system = ActorSystem("EchoServiceSpec", ConfigFactory.parseString("""
+akka.actor.default-dispatcher.fork-join-executor.parallelism-max = 3
+"""))
+
+  /*
+   * Discussion of the thread pool size configuration
+   * 
+   * When using the default configuration of 8 threads or more (depending on
+   * the number of processor cores available) the three active actors in the
+   * test will bounce frequently between threads, incurring CPU cache misses
+   * and wake-up latencies from low-power states. Depending on the precise
+   * scheduling patterns for each given run this can lead to variable increases
+   * in response latency.
+   * 
+   * Configure a lower number than the number of active Actors means that
+   * messages will be delayed by having to wait for their destination Actor
+   * to be scheduled again.
+   */
 
   override def afterAll(): Unit = {
     system.shutdown()
@@ -116,17 +134,38 @@ class EchoServiceSpec extends WordSpec with Matchers with BeforeAndAfterAll {
       val N = 200
       val timings = for (i <- 1 to N) yield {
         val string = s"test$i"
-        val start = Deadline.now
+        val start = Timestamp.now
         echo ! Request(string, probe.ref)
         probe.expectMsg(100.millis, s"test run $i", Response(string))
-        val stop = Deadline.now
+        val stop = Timestamp.now
         stop - start
       }
       // discard top 5%
       val sorted = timings.sorted
       val ninetyfifthPercentile = sorted.dropRight(N * 5 / 100).last
-      info(s"sequential SLA min=${sorted.head} max=${sorted.last} 95th=$ninetyfifthPercentile")
+      info(s"SLA min=${sorted.head} max=${sorted.last} 95th=$ninetyfifthPercentile")
       ninetyfifthPercentile should be < 1.millisecond
+    }
+
+    "keep its SLA when used in parallel with Futures" in {
+      implicit val timeout = Timeout(100.millis)
+      import system.dispatcher
+      val echo = echoService("keepSLAfuture")
+      val N = 10000
+      val timingFutures = for (i <- 1 to N) yield {
+        val string = s"test$i"
+        val start = Timestamp.now
+        (echo ? (Request(string, _))) collect {
+          case Response(`string`) => Timestamp.now - start
+        }
+      }
+      val futureOfTimings = Future.sequence(timingFutures)
+      val timings = Await.result(futureOfTimings, 5.seconds)
+      // discard top 5%
+      val sorted = timings.sorted
+      val ninetyfifthPercentile = sorted.dropRight(N * 5 / 100).last
+      info(s"SLA min=${sorted.head} max=${sorted.last} 95th=$ninetyfifthPercentile")
+      ninetyfifthPercentile should be < 100.milliseconds
     }
 
     "keep its SLA when used in parallel" in {
@@ -146,7 +185,7 @@ class EchoServiceSpec extends WordSpec with Matchers with BeforeAndAfterAll {
       // discard top 5%
       val sorted = result.timings.sorted
       val ninetyfifthPercentile = sorted.dropRight(N * 5 / 100).last
-      info(s"parallel SLA min=${sorted.head} max=${sorted.last} 95th=$ninetyfifthPercentile")
+      info(s"SLA min=${sorted.head} max=${sorted.last} 95th=$ninetyfifthPercentile")
       ninetyfifthPercentile should be < 2.milliseconds
     }
 
